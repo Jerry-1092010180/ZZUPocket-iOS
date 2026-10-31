@@ -1,0 +1,61 @@
+name: Publish Windows sideload package
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'New release tag, for example ios-v0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unsigned-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-15
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate new version
+        shell: bash
+        run: |
+          [[ "$RELEASE_TAG" =~ ^ios-v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Use ios-vX.Y.Z'; exit 1; }
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+      - name: Generate project
+        run: |
+          brew install xcodegen
+          xcodegen generate --spec ios/project.yml --project ios
+      - name: Build unsigned device app
+        run: |
+          xcodebuild -project ios/ZZUPocket.xcodeproj -scheme ZZUPocket \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+      - name: Package and verify
+        shell: bash
+        run: |
+          APP="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/ZZUPocket.app"
+          /usr/libexec/PlistBuddy -c 'Print :UILaunchScreen' "$APP/Info.plist"
+          test ! -e "$APP/embedded.mobileprovision"
+          test ! -e "$APP/_CodeSignature"
+          mkdir -p "$RUNNER_TEMP/Payload" dist
+          cp -R "$APP" "$RUNNER_TEMP/Payload/"
+          (cd "$RUNNER_TEMP" && zip -q -r "$GITHUB_WORKSPACE/dist/ZZUPocket-iOS-unsigned.ipa" Payload)
+          cp docs/Windows安装.md dist/Windows安装.md
+          (cd dist && shasum -a 256 ZZUPocket-iOS-unsigned.ipa > ZZUPocket-iOS-unsigned.ipa.sha256)
+      - name: Publish download
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$RELEASE_TAG" dist/* --target "$GITHUB_SHA" \
+            --title "ZZUPocket $RELEASE_TAG — Windows 侧载安装包" \
+            --notes-file docs/Windows安装.md
