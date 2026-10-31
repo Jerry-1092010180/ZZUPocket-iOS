@@ -12,7 +12,6 @@ struct ContentView: View {
                     GraduateScheduleView().tabItem { Label("研究生", systemImage: "graduationcap") }
                     campus.tabItem { Label("校园", systemImage: "building.2") }
                     FocusScreen().tabItem { Label("专注", systemImage: "timer") }
-                    LibraryScreen().tabItem { Label("图书馆", systemImage: "books.vertical") }
                     settings.tabItem { Label("我的", systemImage: "person.crop.circle") }
                 }
                 .tint(PocketStyle.accent)
@@ -85,10 +84,11 @@ struct ContentView: View {
                 }
                 .padding(.horizontal, 18)
                 .padding(.top, 12)
+                .padding(.bottom, 24)
             }
             .background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("课表")
-            .navigationBarTitleDisplayMode(.large)
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar { Button { Task { await model.perform { try await model.refreshSchedule() } } } label: { Image(systemName: "arrow.clockwise") }.disabled(model.busy).accessibilityLabel("同步课表") }
             .overlay { if model.busy { ProgressView() } }
             .task { if model.semesters.isEmpty { await model.perform { try await model.refreshSchedule() } } }
@@ -164,9 +164,11 @@ struct ContentView: View {
                     }.padding(16).background(.background, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
                 }
                 .padding(18)
+                .padding(.bottom, 24)
             }
             .background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("校园")
+            .navigationBarTitleDisplayMode(.inline)
             .overlay { if model.busy { ProgressView() } }
             .sheet(isPresented: $showingRooms) {
                 NavigationStack {
@@ -190,12 +192,20 @@ struct ContentView: View {
     private var settings: some View {
         NavigationStack {
             Form {
+                Section("校园服务") {
+                    NavigationLink {
+                        LibraryScreen()
+                    } label: {
+                        Label("图书馆座位", systemImage: "books.vertical")
+                    }
+                }
                 Section {
                     Button("退出登录", role: .destructive) { model.signOut() }
                 }
                 Section { Text("ZZUPocket 是非官方校园助手。数据直接与学校系统交互，登录令牌仅保存在本机。") }
             }
             .navigationTitle("我的")
+            .navigationBarTitleDisplayMode(.inline)
         }
     }
 }
@@ -217,35 +227,38 @@ private struct GraduateScheduleView: View {
                         }
                     }.frame(maxWidth: .infinity, alignment: .leading).padding(18)
                         .background(LinearGradient(colors: [PocketStyle.accent, PocketStyle.deepAccent], startPoint: .topLeading, endPoint: .bottomTrailing), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
-                Section {
-                    Button { showingLogin = true } label: { Label("登录研究生系统", systemImage: "person.badge.key.fill") }
-                    Button { Task { await grad.refresh() } } label: { Label("同步研究生课表", systemImage: "arrow.clockwise") }.disabled(grad.busy)
-                } footer: {
-                    Text("研究生教务使用学校网页会话，需要在学校页面单独登录；CAS 令牌不能直接查询研究生课表。")
-                }
-                if !grad.terms.isEmpty {
-                    Picker("学期", selection: $grad.selectedTerm) {
-                        ForEach(grad.terms) { term in Text(term.name).tag(term.code) }
-                    }.onChange(of: grad.selectedTerm) { _, code in
-                        if !grad.busy { Task { await grad.selectTerm(code) } }
+                    Section {
+                        Button { showingLogin = true } label: { Label("登录研究生系统", systemImage: "person.badge.key.fill") }
+                        Button { Task { await grad.refresh() } } label: { Label("同步研究生课表", systemImage: "arrow.clockwise") }.disabled(grad.busy)
+                    } footer: {
+                        Text("研究生教务使用学校网页会话，需要在学校页面单独登录；CAS 令牌不能直接查询研究生课表。")
                     }
-                    HStack { weekButton("chevron.left", disabled: grad.week <= 1) { grad.week -= 1 }; Text("第 \(grad.week) 周").font(.headline).frame(maxWidth: .infinity); weekButton("chevron.right", disabled: grad.week >= 30) { grad.week += 1 } }
-                    let selected = grad.lessons.filter { $0.week == grad.week }.sorted { ($0.weekday, $0.start) < ($1.weekday, $1.start) }
-                    if selected.isEmpty { ContentUnavailableView("本周暂无课程", systemImage: "calendar") }
-                    ForEach(1...7, id: \.self) { day in
-                        let rows = selected.filter { $0.weekday == day }
-                        if !rows.isEmpty {
-                            VStack(alignment: .leading, spacing: 10) {
-                                Text(["周一", "周二", "周三", "周四", "周五", "周六", "周日"][day - 1]).font(.headline)
-                                ForEach(rows) { LessonCard(lesson: $0) }
+                    if !grad.terms.isEmpty {
+                        Picker("学期", selection: $grad.selectedTerm) {
+                            ForEach(grad.terms) { term in Text(term.name).tag(term.code) }
+                        }.onChange(of: grad.selectedTerm) { _, code in
+                            if !grad.busy { Task { await grad.selectTerm(code) } }
+                        }
+                        HStack { weekButton("chevron.left", disabled: grad.week <= 1) { grad.week -= 1 }; Text("第 \(grad.week) 周").font(.headline).frame(maxWidth: .infinity); weekButton("chevron.right", disabled: grad.week >= 30) { grad.week += 1 } }
+                        let selected = grad.lessons.filter { $0.week == grad.week }.sorted { ($0.weekday, $0.start) < ($1.weekday, $1.start) }
+                        if selected.isEmpty { ContentUnavailableView("本周暂无课程", systemImage: "calendar") }
+                        ForEach(1...7, id: \.self) { day in
+                            let rows = selected.filter { $0.weekday == day }
+                            if !rows.isEmpty {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    Text(["周一", "周二", "周三", "周四", "周五", "周六", "周日"][day - 1]).font(.headline)
+                                    ForEach(rows) { LessonCard(lesson: $0) }
+                                }
                             }
                         }
                     }
                 }
+                .padding(18)
+                .padding(.bottom, 24)
             }
-            .padding(18)
             .background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("研究生课表")
+            .navigationBarTitleDisplayMode(.inline)
             .overlay { if grad.busy { ProgressView() } }
             .sheet(isPresented: $showingLogin, onDismiss: { Task { await grad.refresh() } }) {
                 NavigationStack {
@@ -357,7 +370,7 @@ private struct LoginView: View {
     }
 }
 
-private enum PocketStyle {
+enum PocketStyle {
     static let accent = Color(red: 0.16, green: 0.39, blue: 0.82)
     static let deepAccent = Color(red: 0.10, green: 0.25, blue: 0.59)
     static let softAccent = Color(red: 0.91, green: 0.94, blue: 1.0)
@@ -370,12 +383,18 @@ private struct LessonCard: View {
         HStack(spacing: 0) {
             RoundedRectangle(cornerRadius: 3).fill(PocketStyle.accent).frame(width: 4)
             VStack(alignment: .leading, spacing: 9) {
-                Text(lesson.name).font(.subheadline.weight(.semibold)).lineLimit(2)
-                HStack(spacing: 12) {
+                Text(lesson.name).font(.subheadline.weight(.semibold))
+                    .fixedSize(horizontal: false, vertical: true)
+                VStack(alignment: .leading, spacing: 6) {
                     Label("第 \(lesson.start)-\(lesson.end) 节", systemImage: "clock")
                     if !lesson.room.isEmpty { Label(lesson.room, systemImage: "location") }
-                }.font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                if !lesson.teacher.isEmpty { Label(lesson.teacher, systemImage: "person") .font(.caption).foregroundStyle(.secondary).lineLimit(1) }
+                }.font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if !lesson.teacher.isEmpty {
+                    Label(lesson.teacher, systemImage: "person")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }.padding(.vertical, 13).padding(.horizontal, 14)
             Spacer(minLength: 0)
         }
@@ -386,7 +405,7 @@ private struct LessonCard: View {
 }
 
 private func weekButton(_ symbol: String, disabled: Bool, action: @escaping () -> Void) -> some View {
-    Button(action: action) { Image(systemName: symbol).font(.subheadline.bold()).frame(width: 40, height: 40).background(.white.opacity(0.17), in: Circle()) }
+    Button(action: action) { Image(systemName: symbol).font(.subheadline.bold()).frame(width: 44, height: 44).background(.white.opacity(0.17), in: Circle()) }
         .disabled(disabled).opacity(disabled ? 0.45 : 1)
         .accessibilityLabel(symbol == "chevron.left" ? "上一周" : "下一周")
 }

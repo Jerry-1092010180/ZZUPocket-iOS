@@ -145,21 +145,21 @@ struct FocusScreen: View {
                     }
                 }
                 .padding(18)
+                .padding(.bottom, 24)
             }
             .background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("专注")
+            .navigationBarTitleDisplayMode(.inline)
         }
     }
 }
 
 struct LibraryScreen: View {
     var body: some View {
-        NavigationStack {
-            LibraryWebView()
-                .navigationTitle("图书馆座位")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbarBackground(.visible, for: .navigationBar)
-        }
+        LibraryWebView()
+            .navigationTitle("图书馆座位")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbarBackground(.visible, for: .navigationBar)
     }
 }
 
