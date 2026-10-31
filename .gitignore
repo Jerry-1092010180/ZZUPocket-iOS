@@ -1,0 +1,4 @@
+.DS_Store
+ios/*.xcodeproj/
+ios/ZZUPocket/Info.plist
+ios/project.personal.yml
