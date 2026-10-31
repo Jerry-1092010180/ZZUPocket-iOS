@@ -18,6 +18,8 @@ targets:
     info:
       path: ZZUPocket/Info.plist
       properties:
+        # Declare a modern launch screen so iPhone uses its native display size.
+        UILaunchScreen: {}
         NSAppTransportSecurity:
           NSExceptionDomains:
             order.lib.zzu.edu.cn:
