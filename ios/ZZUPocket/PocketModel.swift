@@ -60,6 +60,7 @@ final class PocketModel: ObservableObject {
         .lighting: MeterReading(roomID: UserDefaults.standard.string(forKey: "lightingRoomID") ?? ""),
         .airConditioning: MeterReading(roomID: UserDefaults.standard.string(forKey: "airConditioningRoomID") ?? "")
     ]
+    @Published var meterHistory: [MeterKind: [EnergySample]] = [:]
     @Published var activeMeter: MeterKind = .lighting
     @Published var balanceUpdatedAt: Date?
     @Published var balanceError: String?
@@ -88,6 +89,7 @@ final class PocketModel: ObservableObject {
     }
 
     init() {
+        defer { reloadHistory() }
         guard token != nil,
               let data = UserDefaults.standard.data(forKey: "campusCacheV1"),
               let cache = try? JSONDecoder().decode(CampusCache.self, from: data),
@@ -97,6 +99,51 @@ final class PocketModel: ObservableObject {
         for (kind, reading) in [(MeterKind.lighting, cache.lighting), (.airConditioning, cache.airConditioning)] {
             if let reading, reading.roomID == meters[kind]?.roomID { meters[kind] = reading }
         }
+    }
+
+    private func historyKey(for kind: MeterKind) -> String? {
+        guard token != nil, let room = meters[kind]?.roomID.trimmingCharacters(in: .whitespacesAndNewlines), !room.isEmpty else { return nil }
+        let owner = UserDefaults.standard.string(forKey: "campusHistoryAccount") ?? sessionFingerprint
+        let scope = "\(owner)|\(kind.rawValue)|\(room)"
+        let hash = SHA256.hash(data: Data(scope.utf8)).map { String(format: "%02x", $0) }.joined()
+        return "electricityHistoryV1-" + hash
+    }
+
+    private func reloadHistory() {
+        for kind in MeterKind.allCases { loadHistory(for: kind) }
+    }
+
+    private func loadHistory(for kind: MeterKind) {
+        guard let key = historyKey(for: kind),
+              let data = UserDefaults.standard.data(forKey: key),
+              let saved = try? JSONDecoder().decode([EnergySample].self, from: data) else {
+            meterHistory[kind] = []
+            return
+        }
+        let now = Date()
+        meterHistory[kind] = saved.filter { $0.quantity.isFinite && $0.date <= now && $0.date >= now.addingTimeInterval(-EnergyHistory.retention) }.sorted { $0.date < $1.date }
+    }
+
+    private func recordHistory(_ quantity: Double, at date: Date, for kind: MeterKind) {
+        guard let key = historyKey(for: kind) else { return }
+        let samples = EnergyHistory.recording(EnergySample(date: date, quantity: quantity), in: meterHistory[kind] ?? [], now: date)
+        meterHistory[kind] = samples
+        if let data = try? JSONEncoder().encode(samples) { UserDefaults.standard.set(data, forKey: key) }
+    }
+
+    func completeSignIn(account: String, token: String) {
+        TokenStore.save(token)
+        UserDefaults.standard.set(account.trimmingCharacters(in: .whitespacesAndNewlines), forKey: "campusHistoryAccount")
+        self.token = token
+        balance = nil
+        balanceUpdatedAt = nil
+        balanceError = nil
+        for kind in MeterKind.allCases {
+            meters[kind]?.quantity = nil
+            meters[kind]?.updatedAt = nil
+            meters[kind]?.error = nil
+        }
+        reloadHistory()
     }
 
     private func saveCampusCache() {
@@ -119,6 +166,8 @@ final class PocketModel: ObservableObject {
     }
 
     func signOut() {
+        meterHistory = [:]
+        UserDefaults.standard.removeObject(forKey: "campusHistoryAccount")
         UserDefaults.standard.removeObject(forKey: "campusCacheV1")
         TokenStore.save(nil)
         token = nil
@@ -139,6 +188,7 @@ final class PocketModel: ObservableObject {
         guard meters[kind]?.roomID != id else { return }
         meters[kind] = MeterReading(roomID: id)
         UserDefaults.standard.set(id, forKey: kind == .lighting ? "lightingRoomID" : "airConditioningRoomID")
+        loadHistory(for: kind)
         saveCampusCache()
     }
 
@@ -160,8 +210,10 @@ final class PocketModel: ObservableObject {
             do {
                 let quantity = try await electricityQuantity(roomID: room)
                 guard token == sessionToken, meters[kind]?.roomID.trimmingCharacters(in: .whitespacesAndNewlines) == room else { continue }
+                let sampledAt = Date()
                 meters[kind]?.quantity = quantity
-                meters[kind]?.updatedAt = Date()
+                meters[kind]?.updatedAt = sampledAt
+                recordHistory(quantity, at: sampledAt, for: kind)
                 meters[kind]?.error = nil
             } catch {
                 if token == sessionToken, meters[kind]?.roomID.trimmingCharacters(in: .whitespacesAndNewlines) == room {
@@ -248,6 +300,7 @@ final class PocketModel: ObservableObject {
         let templates = (result["resultData"] as? [String: Any])?["templateList"] as? [[String: Any]] ?? []
         let amount = templates.first(where: { $0["code"] as? String == "quantity" })?["value"]
         guard let value = (amount as? NSNumber)?.doubleValue ?? Double("\(amount ?? "")") else { throw PocketError.message("未找到剩余电量") }
+        guard value.isFinite else { throw PocketError.message("学校返回的电量不是有效数字") }
         return value
     }
 
