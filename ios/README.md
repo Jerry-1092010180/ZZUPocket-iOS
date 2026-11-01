@@ -1,8 +1,14 @@
 # ZZUPocket iOS (iOS 17+)
 
-Native SwiftUI client, separate from the Android app. Current scope: CAS login (including SMS MFA), undergraduate semester schedule, graduate semester schedule (separate school web CAS login), campus card balance and recent 30-day transactions, electricity lookup by full room ID or online room picker, basic focus timer with local records, and school library website. Electricity history, custom timetable, room occupancy, statistics, offline schedule cache, notifications and widgets are **not** implemented. No account data is embedded in the build. Graduate sign-in uses a WKWebView; the web session may expire and require signing in again. Focus timer runs only while the app process is alive (no background service yet).
+Native SwiftUI client, separate from the Android app. Current scope: CAS login (including SMS MFA), undergraduate semester schedule, graduate semester schedule (separate school web CAS login), campus card balance and recent 30-day transactions, electricity lookup by full room ID or online room picker, basic focus timer with local records, and school library website. Custom timetable, room occupancy, statistics, offline schedule cache, notifications and widgets are **not** implemented. No account data is embedded in the build. Graduate sign-in uses a WKWebView; the web session may expire and require signing in again. Focus timer runs only while the app process is alive (no background service yet).
+
+## Electricity trends
+
+Lighting and air-conditioning meters have separate remaining-electricity charts with hour, day, week and month ranges. Tap or drag to inspect a sample. Successful foreground refreshes accumulate local history for 90 days; the school lookup does not supply historical backfill. Missing intervals remain gaps and balance increases are marked as possible recharges. Recorded decreases describe sampled intervals, not a complete electricity bill. History is isolated by account, meter kind and full room ID. It is stored only on this device; logging out hides it, and signing back into the same account restores it.
 
 ## Build
+
+For maintainers publishing a Windows sideload package: enable Actions in your fork, then run **Publish Windows sideload package** with a new version such as `ios-v0.1.0`. It builds an unsigned IPA, checks launch metadata and the absence of personal provisioning data, and creates a GitHub Release containing the IPA, checksum and Windows instructions. Reusing an existing release tag fails instead of overwriting downloads. This workflow requires repository contents write permission; it does not sign apps or upload to TestFlight. The new release workflow must be run and checked on GitHub before advertising a download as available.
 
 On macOS with Xcode 16.4 and XcodeGen:
 
@@ -32,4 +38,3 @@ After building, check the packaged app's `Info.plist` for a `UILaunchScreen` dic
 - The final course card can scroll clear of the floating tab bar, in light and dark appearance.
 
 For personal signing, keep any local specification in `ios/project.personal.yml` (ignored by Git), generate the project from that file, and select your own development team. Do not commit personal signing settings or generated Xcode files.
-
