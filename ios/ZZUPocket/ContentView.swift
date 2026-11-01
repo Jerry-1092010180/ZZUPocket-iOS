@@ -225,7 +225,7 @@ struct ContentView: View {
                 Text("未配置电表；只有一路电表的寝室可留空另一项。")
                     .font(.caption).foregroundStyle(.secondary)
         }
-        .padding(16).background(.background, in: RoundedRectangle(cornerRadius: 20))
+        }.padding(16).background(.background, in: RoundedRectangle(cornerRadius: 20))
     }
 
     private var settings: some View {
