@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import CryptoKit
 
 struct Lesson: Identifiable {
     let id: String
@@ -34,6 +35,19 @@ struct RoomNode: Identifiable {
     let name: String
 }
 
+enum MeterKind: String, CaseIterable, Identifiable {
+    case lighting, airConditioning
+    var id: String { rawValue }
+    var title: String { self == .lighting ? "照明用电" : "空调用电" }
+}
+
+struct MeterReading: Codable {
+    var roomID: String
+    var quantity: Double?
+    var updatedAt: Date?
+    var error: String?
+}
+
 @MainActor
 final class PocketModel: ObservableObject {
     @Published var token: String? = TokenStore.load()
@@ -42,16 +56,57 @@ final class PocketModel: ObservableObject {
     @Published var lessons: [Lesson] = []
     @Published var week = 1
     @Published var balance: Double?
-    @Published var electricity: Double?
+    @Published var meters: [MeterKind: MeterReading] = [
+        .lighting: MeterReading(roomID: UserDefaults.standard.string(forKey: "lightingRoomID") ?? ""),
+        .airConditioning: MeterReading(roomID: UserDefaults.standard.string(forKey: "airConditioningRoomID") ?? "")
+    ]
+    @Published var activeMeter: MeterKind = .lighting
+    @Published var balanceUpdatedAt: Date?
+    @Published var balanceError: String?
+    @Published var campusRefreshing = false
     @Published var trades: [CardTrade] = []
     @Published var roomNodes: [RoomNode] = []
     @Published var roomLevel = "area"
     @Published var roomNextLevel: String?
     @Published var roomIsLastLevel = false
     @Published var roomScope: [String: String] = [:]
-    @Published var roomId = UserDefaults.standard.string(forKey: "roomId") ?? ""
+    // The old single room ID is not assigned to either meter without confirmation.
+    var legacyRoomID: String { UserDefaults.standard.string(forKey: "roomId") ?? "" }
     @Published var busy = false
     @Published var error: String?
+
+    private struct CampusCache: Codable {
+        let session: String
+        let balance: Double?
+        let balanceUpdatedAt: Date?
+        let lighting: MeterReading?
+        let airConditioning: MeterReading?
+    }
+
+    private var sessionFingerprint: String {
+        SHA256.hash(data: Data((token ?? "").utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    init() {
+        guard token != nil,
+              let data = UserDefaults.standard.data(forKey: "campusCacheV1"),
+              let cache = try? JSONDecoder().decode(CampusCache.self, from: data),
+              cache.session == sessionFingerprint else { return }
+        balance = cache.balance
+        balanceUpdatedAt = cache.balanceUpdatedAt
+        for (kind, reading) in [(MeterKind.lighting, cache.lighting), (.airConditioning, cache.airConditioning)] {
+            if let reading, reading.roomID == meters[kind]?.roomID { meters[kind] = reading }
+        }
+    }
+
+    private func saveCampusCache() {
+        guard loggedIn else { return }
+        let cache = CampusCache(session: sessionFingerprint, balance: balance, balanceUpdatedAt: balanceUpdatedAt,
+                                lighting: meters[.lighting], airConditioning: meters[.airConditioning])
+        if let data = try? JSONEncoder().encode(cache) {
+            UserDefaults.standard.set(data, forKey: "campusCacheV1")
+        }
+    }
 
     var loggedIn: Bool { validToken != nil }
 
@@ -64,18 +119,56 @@ final class PocketModel: ObservableObject {
     }
 
     func signOut() {
+        UserDefaults.standard.removeObject(forKey: "campusCacheV1")
         TokenStore.save(nil)
         token = nil
         semesters = []
         lessons = []
         balance = nil
-        electricity = nil
+        balanceUpdatedAt = nil
+        balanceError = nil
+        for kind in MeterKind.allCases {
+            meters[kind]?.quantity = nil
+            meters[kind]?.updatedAt = nil
+            meters[kind]?.error = nil
+        }
         trades = []
     }
 
-    func saveRoom() {
-        roomId = roomId.trimmingCharacters(in: .whitespacesAndNewlines)
-        UserDefaults.standard.set(roomId, forKey: "roomId")
+    func setRoom(_ id: String, for kind: MeterKind) {
+        guard meters[kind]?.roomID != id else { return }
+        meters[kind] = MeterReading(roomID: id)
+        UserDefaults.standard.set(id, forKey: kind == .lighting ? "lightingRoomID" : "airConditioningRoomID")
+        saveCampusCache()
+    }
+
+    func refreshCampus() async {
+        guard loggedIn, !campusRefreshing else { return }
+        campusRefreshing = true
+        defer { campusRefreshing = false; saveCampusCache() }
+        let sessionToken = token
+        do {
+            try await refreshBalance()
+            if token == sessionToken { balanceError = nil }
+        } catch {
+            if token == sessionToken { balanceError = error.localizedDescription }
+        }
+        for kind in MeterKind.allCases {
+            guard !Task.isCancelled, token == sessionToken, loggedIn else { break }
+            let room = (meters[kind]?.roomID ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !room.isEmpty else { continue }
+            do {
+                let quantity = try await electricityQuantity(roomID: room)
+                guard token == sessionToken, meters[kind]?.roomID.trimmingCharacters(in: .whitespacesAndNewlines) == room else { continue }
+                meters[kind]?.quantity = quantity
+                meters[kind]?.updatedAt = Date()
+                meters[kind]?.error = nil
+            } catch {
+                if token == sessionToken, meters[kind]?.roomID.trimmingCharacters(in: .whitespacesAndNewlines) == room {
+                    meters[kind]?.error = error.localizedDescription
+                }
+            }
+        }
     }
 
     func perform(_ work: @escaping () async throws -> Void) async {
@@ -137,20 +230,25 @@ final class PocketModel: ObservableObject {
             (card["amount"] as? NSNumber)?.doubleValue ?? Double("\(card["amount"] ?? "")")
         }
         guard let value = (cards.count > 1 ? amount(cards[1]) : nil) ?? cards.reversed().compactMap(amount).first else { throw PocketError.message("未找到校园卡余额") }
+        guard self.token == token else { return }
         balance = value
+        balanceUpdatedAt = Date()
     }
 
-    func refreshElectricity() async throws {
+    private func electricityQuantity(roomID: String) async throws -> Double {
         let access = try await ecardAccessToken()
-        let parts = roomId.split(separator: "-", omittingEmptySubsequences: false)
+        let parts = roomID.split(separator: "-", omittingEmptySubsequences: false)
         guard parts.count == 5, parts[2].isEmpty, !parts[0].isEmpty, !parts[1].isEmpty, !parts[3].isEmpty, !parts[4].isEmpty else { throw PocketError.message("房间号格式应为 area-building--level-room") }
-        let payload: [String: Any] = ["utilityType": "electric", "bigArea": "", "area": String(parts[0]), "building": String(parts[1]), "unit": "", "level": String(parts[3]), "room": roomId, "subArea": ""]
+        let payload: [String: Any] = ["utilityType": "electric", "bigArea": "", "area": String(parts[0]), "building": String(parts[1]), "unit": "", "level": String(parts[3]), "room": roomID, "subArea": ""]
         let accountURL = try API.url(API.ecard, "/server/utilities/account")
         let result = try await API.postJSON(accountURL, token: access, payload: payload)
+        guard result["success"] as? Bool == true else {
+            throw PocketError.message("学校未返回有效的电表数据，请确认编号")
+        }
         let templates = (result["resultData"] as? [String: Any])?["templateList"] as? [[String: Any]] ?? []
         let amount = templates.first(where: { $0["code"] as? String == "quantity" })?["value"]
         guard let value = (amount as? NSNumber)?.doubleValue ?? Double("\(amount ?? "")") else { throw PocketError.message("未找到剩余电量") }
-        electricity = value
+        return value
     }
 
     func refreshTrades() async throws {
@@ -175,8 +273,7 @@ final class PocketModel: ObservableObject {
 
     func pickRoomNode(_ node: RoomNode) async throws {
         if roomIsLastLevel {
-            roomId = node.id
-            saveRoom()
+            setRoom(node.id, for: activeMeter)
             return
         }
         guard let next = roomNextLevel else { throw PocketError.message("学校没有返回下一层房间类型") }

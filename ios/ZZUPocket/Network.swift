@@ -18,6 +18,7 @@ enum API {
     static func request(_ url: URL, method: String = "GET", headers: [String: String] = [:], body: Data? = nil, redirects: Bool = true) async throws -> (Data, HTTPURLResponse) {
         let session = redirects ? URLSession.shared : URLSession(configuration: .ephemeral, delegate: NoRedirects.shared, delegateQueue: nil)
         var request = URLRequest(url: url)
+        request.cachePolicy = .reloadIgnoringLocalCacheData
         request.httpMethod = method
         request.httpBody = body
         request.timeoutInterval = 25

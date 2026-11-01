@@ -3,6 +3,7 @@ import SwiftUI
 struct ContentView: View {
     @EnvironmentObject private var model: PocketModel
     @State private var showingRooms = false
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         Group {
@@ -17,6 +18,13 @@ struct ContentView: View {
                 .tint(PocketStyle.accent)
             } else {
                 LoginView()
+            }
+        }
+        .task(id: scenePhase == .active && model.loggedIn) {
+            guard scenePhase == .active, model.loggedIn else { return }
+            while !Task.isCancelled {
+                await model.refreshCampus()
+                do { try await Task.sleep(for: .seconds(60)) } catch { return }
             }
         }
         .alert("提示", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
@@ -104,11 +112,17 @@ struct ContentView: View {
                             .font(.subheadline.weight(.semibold)).foregroundStyle(.white.opacity(0.85))
                         Text(model.balance.map { String(format: "¥%.2f", $0) } ?? "¥ --")
                             .font(.system(size: 38, weight: .bold, design: .rounded)).foregroundStyle(.white).contentTransition(.numericText())
-                        Button { Task { await model.perform { try await model.refreshBalance() } } } label: {
+                        Button { Task { await model.refreshCampus() } } label: {
                             Label("刷新余额", systemImage: "arrow.clockwise").font(.subheadline.weight(.semibold))
                                 .padding(.horizontal, 14).padding(.vertical, 9)
                                 .background(.white.opacity(0.18), in: Capsule())
-                        }.foregroundStyle(.white).disabled(model.busy)
+                        }.foregroundStyle(.white).disabled(model.campusRefreshing)
+                        if let date = model.balanceUpdatedAt {
+                            Text("上次成功查询 \(date.formatted(date: .abbreviated, time: .shortened))").font(.caption).foregroundStyle(.white)
+                        }
+                        if let error = model.balanceError {
+                            Text("刷新失败：\(error)；已有数字为上次结果").font(.caption).foregroundStyle(.white)
+                        }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading).padding(20)
                     .background(LinearGradient(colors: [PocketStyle.accent, PocketStyle.deepAccent], startPoint: .topLeading, endPoint: .bottomTrailing), in: RoundedRectangle(cornerRadius: 24, style: .continuous))
@@ -141,27 +155,15 @@ struct ContentView: View {
                         }
                     }
 
-                    VStack(alignment: .leading, spacing: 14) {
-                        Label("宿舍电量", systemImage: "bolt.fill").font(.headline).foregroundStyle(PocketStyle.deepAccent)
-                        HStack(alignment: .firstTextBaseline, spacing: 6) {
-                            Text(model.electricity.map { String(format: "%.2f", $0) } ?? "--")
-                                .font(.system(size: 34, weight: .bold, design: .rounded).monospacedDigit())
-                            Text("度").foregroundStyle(.secondary)
-                        }
-                        TextField("房间编号，例如 99-16--32-8101", text: $model.roomId)
-                            .textInputAutocapitalization(.never).autocorrectionDisabled().onSubmit { model.saveRoom() }
-                            .padding(13).background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12))
-                        HStack(spacing: 10) {
-                            Button { showingRooms = true; Task { await model.perform { try await model.startRoomPicker() } } } label: {
-                                Label("选择房间", systemImage: "location.magnifyingglass").frame(maxWidth: .infinity).padding(12)
-                                    .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12))
-                            }.disabled(model.busy)
-                            Button { model.saveRoom(); Task { await model.perform { try await model.refreshElectricity() } } } label: {
-                                Label("查电量", systemImage: "bolt.fill").frame(maxWidth: .infinity).padding(12)
-                                    .foregroundStyle(.white).background(PocketStyle.accent, in: RoundedRectangle(cornerRadius: 12))
-                            }.disabled(model.busy || model.roomId.isEmpty)
-                        }.font(.subheadline.weight(.semibold))
-                    }.padding(16).background(.background, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                    ForEach(MeterKind.allCases) { kind in
+                        meterCard(kind)
+                    }
+                    Text("前台约每 60 秒查询，回到 App 自动刷新；数据以学校系统返回为准。照明与空调使用独立电表编号，请分别确认，不自动推算。")
+                        .font(.caption).foregroundStyle(.secondary)
+                    if !model.legacyRoomID.isEmpty {
+                        Text("旧版房间编号：\(model.legacyRoomID)。请确认它属于照明还是空调后，填入对应栏位。")
+                            .font(.caption).textSelection(.enabled)
+                    }
                 }
                 .padding(18)
                 .padding(.bottom, 24)
@@ -169,13 +171,14 @@ struct ContentView: View {
             .background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("校园")
             .navigationBarTitleDisplayMode(.inline)
-            .overlay { if model.busy { ProgressView() } }
+            .task { await model.refreshCampus() }
+            .refreshable { await model.refreshCampus() }
             .sheet(isPresented: $showingRooms) {
                 NavigationStack {
                     List(model.roomNodes) { node in
                         Button(node.name) {
                             if model.roomIsLastLevel {
-                                Task { await model.perform { try await model.pickRoomNode(node) }; if model.error == nil { showingRooms = false } }
+                                Task { await model.perform { try await model.pickRoomNode(node) }; if model.error == nil { showingRooms = false; await model.refreshCampus() } }
                             } else {
                                 Task { await model.perform { try await model.pickRoomNode(node) } }
                             }
@@ -187,6 +190,42 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    private func meterCard(_ kind: MeterKind) -> some View {
+        let reading = model.meters[kind]
+        return VStack(alignment: .leading, spacing: 12) {
+            Label(kind.title, systemImage: kind == .lighting ? "lightbulb.fill" : "snowflake").font(.headline)
+            Text(reading?.quantity.map { String(format: "%.2f 度", $0) } ?? "-- 度")
+                .font(.system(size: 32, weight: .bold, design: .rounded).monospacedDigit())
+            if let date = reading?.updatedAt {
+                Text("上次成功查询 \(date.formatted(date: .abbreviated, time: .shortened))").font(.caption).foregroundStyle(.secondary)
+            }
+            if let error = reading?.error {
+                Text("刷新失败：\(error)；已有数字为上次结果").font(.caption).foregroundStyle(.red)
+            }
+            TextField("\(kind.title)电表完整编号", text: Binding(
+                get: { model.meters[kind]?.roomID ?? "" },
+                set: { model.setRoom($0, for: kind) }
+            ))
+            .textInputAutocapitalization(.never).autocorrectionDisabled()
+            .textFieldStyle(.roundedBorder)
+            HStack {
+                Button("在线选择电表") {
+                    model.activeMeter = kind
+                    showingRooms = true
+                    Task { await model.perform { try await model.startRoomPicker() } }
+                }.disabled(model.busy)
+                Spacer()
+                Button("刷新") { Task { await model.refreshCampus() } }
+                    .disabled(model.campusRefreshing)
+            }
+            if reading?.roomID.isEmpty != false {
+                Text("未配置电表；只有一路电表的寝室可留空另一项。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .padding(16).background(.background, in: RoundedRectangle(cornerRadius: 20))
     }
 
     private var settings: some View {
