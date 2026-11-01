@@ -204,6 +204,7 @@ struct ContentView: View {
             if let error = reading?.error {
                 Text("刷新失败：\(error)；已有数字为上次结果").font(.caption).foregroundStyle(.red)
             }
+            ElectricityTrendView(samples: model.meterHistory[kind] ?? [], meterName: kind.title)
             TextField("\(kind.title)电表完整编号", text: Binding(
                 get: { model.meters[kind]?.roomID ?? "" },
                 set: { model.setRoom($0, for: kind) }
@@ -223,7 +224,6 @@ struct ContentView: View {
             if reading?.roomID.isEmpty != false {
                 Text("未配置电表；只有一路电表的寝室可留空另一项。")
                     .font(.caption).foregroundStyle(.secondary)
-            }
         }
         .padding(16).background(.background, in: RoundedRectangle(cornerRadius: 20))
     }
@@ -401,11 +401,11 @@ private struct LoginView: View {
 
     private func finish(state: String) async throws {
         let token = try await CAS.login(account: account, password: password, state: state)
-        TokenStore.save(token)
+        model.completeSignIn(account: account, token: token)
         password = ""
         code = ""
         challenge = nil
-        model.token = token
+        
     }
 }
 
