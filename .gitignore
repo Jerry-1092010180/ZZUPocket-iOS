@@ -2,3 +2,6 @@
 ios/*.xcodeproj/
 ios/ZZUPocket/Info.plist
 ios/project.personal.yml
+
+# Personal offline history must never be published.
+ios/ZZUPocket/PrivateHistorySnapshot.json

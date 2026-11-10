@@ -22,6 +22,14 @@ jobs:
         run: sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
       - name: Install XcodeGen
         run: brew install xcodegen
+      - name: Check campus model and timetable behavior
+        run: |
+          swiftc -parse-as-library ios/ZZUPocket/ElectricityHistory.swift ios/ZZUPocket/PocketModel.swift ios/Tests/PocketModelChecks.swift -o "$RUNNER_TEMP/model-checks"
+          "$RUNNER_TEMP/model-checks"
+          swiftc -parse-as-library ios/ZZUPocket/ElectricityHistory.swift ios/ZZUPocket/PocketModel.swift ios/Tests/ScheduleCacheChecks.swift -o "$RUNNER_TEMP/schedule-checks"
+          "$RUNNER_TEMP/schedule-checks"
+          swiftc -parse-as-library ios/ZZUPocket/Network.swift ios/Tests/AcademicRedirectChecks.swift -o "$RUNNER_TEMP/redirect-checks"
+          "$RUNNER_TEMP/redirect-checks"
       - name: Generate project
         run: xcodegen generate --spec ios/project.yml --project ios
       - name: Build device app without signing
