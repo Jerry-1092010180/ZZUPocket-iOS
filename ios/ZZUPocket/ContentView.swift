@@ -3,6 +3,8 @@ import SwiftUI
 struct ContentView: View {
     @EnvironmentObject private var model: PocketModel
     @State private var showingRooms = false
+    @State private var editingMeter: MeterKind?
+    @FocusState private var focusedMeter: MeterKind?
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -38,6 +40,10 @@ struct ContentView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
+                if let date = model.scheduleUpdatedAt {
+                    Text("本机课表 · 最近同步 \(date.formatted(date: .abbreviated, time: .shortened))；调课以学校最新数据为准")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 if !model.semesters.isEmpty {
                     VStack(alignment: .leading, spacing: 10) {
                         Label("当前学期", systemImage: "sparkles")
@@ -107,6 +113,14 @@ struct ContentView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
+                    NavigationLink {
+                        RaspberryHistoryView()
+                    } label: {
+                        Label("树莓派历史记录", systemImage: "chart.xyaxis.line")
+                            .font(.headline).frame(maxWidth: .infinity, alignment: .leading).padding()
+                            .background(PocketStyle.accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 16))
+                    }
+
                     VStack(alignment: .leading, spacing: 14) {
                         Label("校园卡余额", systemImage: "creditcard.fill")
                             .font(.subheadline.weight(.semibold)).foregroundStyle(.white.opacity(0.85))
@@ -158,12 +172,8 @@ struct ContentView: View {
                     ForEach(MeterKind.allCases) { kind in
                         meterCard(kind)
                     }
-                    Text("前台约每 60 秒查询，回到 App 自动刷新；数据以学校系统返回为准。照明与空调使用独立电表编号，请分别确认，不自动推算。")
+                    Text("前台约每 60 秒查询，回到 App 自动刷新；后台由系统择机更新，可在“我的”查看状态。数据以学校系统返回为准，照明与空调请分别选择电表。")
                         .font(.caption).foregroundStyle(.secondary)
-                    if !model.legacyRoomID.isEmpty {
-                        Text("旧版房间编号：\(model.legacyRoomID)。请确认它属于照明还是空调后，填入对应栏位。")
-                            .font(.caption).textSelection(.enabled)
-                    }
                 }
                 .padding(18)
                 .padding(.bottom, 24)
@@ -173,12 +183,20 @@ struct ContentView: View {
             .navigationBarTitleDisplayMode(.inline)
             .task { await model.refreshCampus() }
             .refreshable { await model.refreshCampus() }
-            .sheet(isPresented: $showingRooms) {
+            .sheet(isPresented: $showingRooms, onDismiss: { focusedMeter = nil }) {
                 NavigationStack {
                     List(model.roomNodes) { node in
                         Button(node.name) {
                             if model.roomIsLastLevel {
-                                Task { await model.perform { try await model.pickRoomNode(node) }; if model.error == nil { showingRooms = false; await model.refreshCampus() } }
+                                Task {
+                                    await model.perform { try await model.pickRoomNode(node) }
+                                    if model.error == nil {
+                                        focusedMeter = nil
+                                        editingMeter = nil
+                                        showingRooms = false
+                                        await model.refreshCampus()
+                                    }
+                                }
                             } else {
                                 Task { await model.perform { try await model.pickRoomNode(node) } }
                             }
@@ -205,14 +223,33 @@ struct ContentView: View {
                 Text("刷新失败：\(error)；已有数字为上次结果").font(.caption).foregroundStyle(.red)
             }
             ElectricityTrendView(samples: model.meterHistory[kind] ?? [], meterName: kind.title)
-            TextField("\(kind.title)电表完整编号", text: Binding(
-                get: { model.meters[kind]?.roomID ?? "" },
-                set: { model.setRoom($0, for: kind) }
-            ))
-            .textInputAutocapitalization(.never).autocorrectionDisabled()
-            .textFieldStyle(.roundedBorder)
+            if editingMeter == kind {
+                TextField("\(kind.title)电表完整编号", text: Binding(
+                    get: { model.meters[kind]?.roomID ?? "" },
+                    set: { model.setRoom($0, for: kind) }
+                ))
+                .textInputAutocapitalization(.never).autocorrectionDisabled()
+                .textFieldStyle(.roundedBorder)
+                .focused($focusedMeter, equals: kind)
+                .submitLabel(.done)
+                .onSubmit { finishMeterEditing() }
+                Button("完成输入") { finishMeterEditing() }
+                    .font(.subheadline)
+            } else {
+                HStack(alignment: .firstTextBaseline, spacing: 12) {
+                    Text(reading?.roomID.isEmpty == false ? (reading?.roomID ?? "") : "尚未选择电表")
+                        .font(.caption.monospaced()).foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Button(reading?.roomID.isEmpty == false ? "手动修改" : "手动输入") {
+                        editingMeter = kind
+                        focusedMeter = kind
+                    }.font(.subheadline)
+                }
+            }
             HStack {
                 Button("在线选择电表") {
+                    finishMeterEditing()
                     model.activeMeter = kind
                     showingRooms = true
                     Task { await model.perform { try await model.startRoomPicker() } }
@@ -224,13 +261,20 @@ struct ContentView: View {
             if reading?.roomID.isEmpty != false {
                 Text("未配置电表；只有一路电表的寝室可留空另一项。")
                     .font(.caption).foregroundStyle(.secondary)
+            }
         }
-        }.padding(16).background(.background, in: RoundedRectangle(cornerRadius: 20))
+        .padding(16).background(.background, in: RoundedRectangle(cornerRadius: 20))
+    }
+
+    private func finishMeterEditing() {
+        focusedMeter = nil
+        editingMeter = nil
     }
 
     private var settings: some View {
         NavigationStack {
             Form {
+                BackgroundRefreshSettings()
                 Section("校园服务") {
                     NavigationLink {
                         LibraryScreen()
@@ -405,7 +449,6 @@ private struct LoginView: View {
         password = ""
         code = ""
         challenge = nil
-        
     }
 }
 

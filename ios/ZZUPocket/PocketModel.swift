@@ -1,8 +1,27 @@
 import Foundation
 import Combine
 import CryptoKit
+import CoreFoundation
 
-struct Lesson: Identifiable {
+// eCard recharge configuration uses yuan; do not select portal cards by index.
+func parseCampusCardBalance(_ data: [String: Any]) throws -> Double {
+    guard let raw = data["balance"] else { throw PocketError.message("学校一卡通未返回余额字段") }
+    let value: Double
+    if let number = raw as? NSNumber {
+        guard CFGetTypeID(number) != CFBooleanGetTypeID() else { throw PocketError.message("学校一卡通余额格式有误") }
+        value = number.doubleValue
+    } else if let text = raw as? String,
+              text.trimmingCharacters(in: .whitespacesAndNewlines).range(of: #"^-?[0-9]+(?:\.[0-9]{1,2})?$"#, options: .regularExpression) != nil,
+              let amount = Double(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+        value = amount
+    } else { throw PocketError.message("学校一卡通余额格式有误") }
+    let cents = value * 100
+    guard value.isFinite, cents.isFinite, abs(cents) <= 9007199254740991,
+          abs(cents - cents.rounded()) <= 0.000001 else { throw PocketError.message("学校一卡通余额数值无效") }
+    return value
+}
+
+struct Lesson: Identifiable, Codable {
     let id: String
     let name: String
     let week: Int
@@ -15,7 +34,7 @@ struct Lesson: Identifiable {
     let teacher: String
 }
 
-struct Semester: Identifiable {
+struct Semester: Identifiable, Codable {
     let id: Int
     let name: String
     let startDate: String?
@@ -48,9 +67,14 @@ struct MeterReading: Codable {
     var error: String?
 }
 
+enum CampusRefreshOutcome {
+    case complete, partial, failed, loggedOut, busy, cancelled
+}
+
 @MainActor
 final class PocketModel: ObservableObject {
     @Published var token: String? = TokenStore.load()
+    @Published var scheduleUpdatedAt: Date?
     @Published var semesters: [Semester] = []
     @Published var selectedSemester: Int?
     @Published var lessons: [Lesson] = []
@@ -71,8 +95,6 @@ final class PocketModel: ObservableObject {
     @Published var roomNextLevel: String?
     @Published var roomIsLastLevel = false
     @Published var roomScope: [String: String] = [:]
-    // The old single room ID is not assigned to either meter without confirmation.
-    var legacyRoomID: String { UserDefaults.standard.string(forKey: "roomId") ?? "" }
     @Published var busy = false
     @Published var error: String?
 
@@ -89,15 +111,46 @@ final class PocketModel: ObservableObject {
     }
 
     init() {
-        defer { reloadHistory() }
+        defer { reloadHistory(); restoreScheduleCache() }
         guard token != nil,
               let data = UserDefaults.standard.data(forKey: "campusCacheV1"),
               let cache = try? JSONDecoder().decode(CampusCache.self, from: data),
               cache.session == sessionFingerprint else { return }
-        balance = cache.balance
-        balanceUpdatedAt = cache.balanceUpdatedAt
+        // Discard cached balance from the previous portal source.
+        balance = nil
+        balanceUpdatedAt = nil
         for (kind, reading) in [(MeterKind.lighting, cache.lighting), (.airConditioning, cache.airConditioning)] {
             if let reading, reading.roomID == meters[kind]?.roomID { meters[kind] = reading }
+        }
+    }
+
+    private struct ScheduleCache: Codable {
+        let session: String
+        let semesters: [Semester]
+        let selected: Int
+        let lessons: [Lesson]
+        let updatedAt: Date
+    }
+
+    private func restoreScheduleCache() {
+        guard token != nil,
+              let data = UserDefaults.standard.data(forKey: "scheduleCacheV1"),
+              let cache = try? JSONDecoder().decode(ScheduleCache.self, from: data),
+              cache.session == sessionFingerprint,
+              cache.semesters.contains(where: { $0.id == cache.selected }) else { return }
+        semesters = cache.semesters
+        selectedSemester = cache.selected
+        lessons = cache.lessons
+        scheduleUpdatedAt = cache.updatedAt
+        updateScheduleWeek()
+    }
+
+    private func saveScheduleCache() {
+        guard let selectedSemester, let scheduleUpdatedAt else { return }
+        let cache = ScheduleCache(session: sessionFingerprint, semesters: semesters,
+                                  selected: selectedSemester, lessons: lessons, updatedAt: scheduleUpdatedAt)
+        if let data = try? JSONEncoder().encode(cache) {
+            UserDefaults.standard.set(data, forKey: "scheduleCacheV1")
         }
     }
 
@@ -135,6 +188,11 @@ final class PocketModel: ObservableObject {
         TokenStore.save(token)
         UserDefaults.standard.set(account.trimmingCharacters(in: .whitespacesAndNewlines), forKey: "campusHistoryAccount")
         self.token = token
+        semesters = []
+        selectedSemester = nil
+        lessons = []
+        scheduleUpdatedAt = nil
+        restoreScheduleCache()
         balance = nil
         balanceUpdatedAt = nil
         balanceError = nil
@@ -169,6 +227,9 @@ final class PocketModel: ObservableObject {
         meterHistory = [:]
         UserDefaults.standard.removeObject(forKey: "campusHistoryAccount")
         UserDefaults.standard.removeObject(forKey: "campusCacheV1")
+        UserDefaults.standard.removeObject(forKey: "scheduleCacheV1")
+        scheduleUpdatedAt = nil
+        selectedSemester = nil
         TokenStore.save(nil)
         token = nil
         semesters = []
@@ -192,35 +253,49 @@ final class PocketModel: ObservableObject {
         saveCampusCache()
     }
 
-    func refreshCampus() async {
-        guard loggedIn, !campusRefreshing else { return }
+    @discardableResult
+    func refreshCampus() async -> CampusRefreshOutcome {
+        guard !Task.isCancelled else { return .cancelled }
+        guard loggedIn else { return .loggedOut }
+        guard !campusRefreshing else { return .busy }
         campusRefreshing = true
         defer { campusRefreshing = false; saveCampusCache() }
         let sessionToken = token
+        let expected = 1 + MeterKind.allCases.filter { !(meters[$0]?.roomID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) }.count
+        var successes = 0
         do {
             try await refreshBalance()
-            if token == sessionToken { balanceError = nil }
+            guard !Task.isCancelled else { return .cancelled }
+            guard token == sessionToken else { return .loggedOut }
+            balanceError = nil
+            successes += 1
         } catch {
+            if Task.isCancelled || error is CancellationError { return .cancelled }
             if token == sessionToken { balanceError = error.localizedDescription }
         }
         for kind in MeterKind.allCases {
-            guard !Task.isCancelled, token == sessionToken, loggedIn else { break }
+            guard !Task.isCancelled else { return .cancelled }
+            guard token == sessionToken, loggedIn else { return .loggedOut }
             let room = (meters[kind]?.roomID ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard !room.isEmpty else { continue }
             do {
                 let quantity = try await electricityQuantity(roomID: room)
+                guard !Task.isCancelled else { return .cancelled }
                 guard token == sessionToken, meters[kind]?.roomID.trimmingCharacters(in: .whitespacesAndNewlines) == room else { continue }
                 let sampledAt = Date()
                 meters[kind]?.quantity = quantity
                 meters[kind]?.updatedAt = sampledAt
                 recordHistory(quantity, at: sampledAt, for: kind)
                 meters[kind]?.error = nil
+                successes += 1
             } catch {
+                if Task.isCancelled || error is CancellationError { return .cancelled }
                 if token == sessionToken, meters[kind]?.roomID.trimmingCharacters(in: .whitespacesAndNewlines) == room {
                     meters[kind]?.error = error.localizedDescription
                 }
             }
         }
+        return successes == expected ? .complete : successes > 0 ? .partial : .failed
     }
 
     func perform(_ work: @escaping () async throws -> Void) async {
@@ -233,6 +308,7 @@ final class PocketModel: ObservableObject {
     func refreshSchedule() async throws {
         guard let token = validToken else { throw PocketError.message("登录已过期，请重新登录") }
         let result = try await API.eas("/eams-door/api/v1/calendar/get-all-semesters", token: token, step: "读取学期列表")
+        guard self.token == token else { throw CancellationError() }
         guard let semestersData = result["data"] as? [[String: Any]] else { throw PocketError.message(result["msg"] as? String ?? "学期列表格式有误") }
         semesters = semestersData.compactMap { value in
             guard let id = value["id"] as? Int else { return nil }
@@ -240,6 +316,7 @@ final class PocketModel: ObservableObject {
         }
         if selectedSemester == nil || !semesters.contains(where: { $0.id == selectedSemester }) {
             let current = try await API.eas("/eams-micro-server/api/v1/semester/current-semester", token: token, step: "读取当前学期")
+            guard self.token == token else { throw CancellationError() }
             let currentID = (current["data"] as? [String: Any])?["id"] as? Int
             selectedSemester = semesters.first(where: { $0.id == currentID })?.id ?? semesters.first?.id
         }
@@ -249,6 +326,7 @@ final class PocketModel: ObservableObject {
     func loadSemester() async throws {
         guard let token = validToken, let selectedSemester else { throw PocketError.message("请选择学期") }
         let result = try await API.eas("/eams-micro-server/api/v1/lesson/student/course-table/\(selectedSemester)", token: token, step: "读取课表")
+        guard self.token == token, self.selectedSemester == selectedSemester else { throw CancellationError() }
         guard let courses = result["data"] as? [[String: Any]] else { throw PocketError.message(result["msg"] as? String ?? "课表格式有误") }
         lessons = courses.flatMap { entry -> [Lesson] in
             let course = entry["course"] as? [String: Any] ?? [:]
@@ -266,6 +344,12 @@ final class PocketModel: ObservableObject {
                 return Lesson(id: "\(entry["id"] ?? "course")-\(index)", name: course["nameZh"] as? String ?? "课程", week: week, weekday: weekday, start: start, end: max(start, slot["endUnit"] as? Int ?? start), date: date, time: [slot["startTime"] as? String, slot["endTime"] as? String].compactMap { $0 }.joined(separator: " - "), room: place.isEmpty ? slot["customPlace"] as? String ?? "" : place, teacher: slot["teacherName"] as? String ?? "")
             }
         }
+        scheduleUpdatedAt = Date()
+        saveScheduleCache()
+        updateScheduleWeek()
+    }
+
+    private func updateScheduleWeek() {
         if let semester = semesters.first(where: { $0.id == selectedSemester }) {
             let current = semester.startDate.flatMap { ISO8601DateFormatter().date(from: String($0.prefix(10)) + "T00:00:00Z") }.map { Int(Date().timeIntervalSince($0) / (7 * 86400)) + 1 } ?? 1
             week = semester.weeks.contains(current) ? current : semester.weeks.first ?? 1
@@ -273,15 +357,18 @@ final class PocketModel: ObservableObject {
     }
 
     func refreshBalance() async throws {
+        balance = nil
+        balanceUpdatedAt = nil
         guard let token = validToken else { throw PocketError.message("登录已过期，请重新登录") }
-        let url = try API.url("https://info.s.zzu.edu.cn", "/portal-api/v1/thrid-adapter/get-person-info-card-list")
-        let (data, response) = try await API.request(url, headers: ["X-Id-Token": token])
-        let result = try API.json(data, response)
-        guard let cards = result["data"] as? [[String: Any]] else { throw PocketError.message("余额数据格式有误") }
-        func amount(_ card: [String: Any]) -> Double? {
-            (card["amount"] as? NSNumber)?.doubleValue ?? Double("\(card["amount"] ?? "")")
+        let access = try await ecardAccessToken()
+        let url = try API.url(API.ecard, "/server/recharge/config")
+        let result = try await API.postJSON(url, token: access, payload: [:])
+        guard result["success"] as? Bool == true,
+              let data = result["resultData"] as? [String: Any] else {
+            throw PocketError.message("学校一卡通未返回有效余额配置")
         }
-        guard let value = (cards.count > 1 ? amount(cards[1]) : nil) ?? cards.reversed().compactMap(amount).first else { throw PocketError.message("未找到校园卡余额") }
+        try Task.checkCancellation()
+        let value = try parseCampusCardBalance(data)
         guard self.token == token else { return }
         balance = value
         balanceUpdatedAt = Date()

@@ -17,6 +17,7 @@ enum API {
 
     static func request(_ url: URL, method: String = "GET", headers: [String: String] = [:], body: Data? = nil, redirects: Bool = true) async throws -> (Data, HTTPURLResponse) {
         let session = redirects ? URLSession.shared : URLSession(configuration: .ephemeral, delegate: NoRedirects.shared, delegateQueue: nil)
+        defer { if !redirects { session.invalidateAndCancel() } }
         var request = URLRequest(url: url)
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.httpMethod = method
@@ -26,12 +27,14 @@ enum API {
         request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
         for (key, value) in headers { request.setValue(value, forHTTPHeaderField: key) }
         let (data, response) = try await session.data(for: request)
-        if !redirects { session.invalidateAndCancel() }
         guard let http = response as? HTTPURLResponse else { throw PocketError.message("无效的服务器响应") }
         return (data, http)
     }
 
     static func json(_ data: Data, _ response: HTTPURLResponse) throws -> [String: Any] {
+        if (300..<400).contains(response.statusCode) {
+            throw PocketError.message("服务发生跳转（HTTP \(response.statusCode)）。请确认手机网络已完成认证，再重新登录学校账号。")
+        }
         guard let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw PocketError.message("服务器返回 HTTP \(response.statusCode)，响应不是 JSON。请稍后重试")
         }
@@ -60,9 +63,41 @@ enum API {
         return try json(data, response)
     }
 
+    static func academicRedirect(from source: URL, response: HTTPURLResponse) throws -> URL {
+        guard let location = response.value(forHTTPHeaderField: "Location"),
+              let target = URL(string: location, relativeTo: source)?.absoluteURL else {
+            throw PocketError.message("本科教务返回跳转，但缺少有效地址。请稍后重试。")
+        }
+        let host = target.host ?? "未知域名"
+        let safePath = target.path.prefix(100)
+        let destination = "\(target.scheme ?? "未知协议")://\(host)\(safePath)"
+        #if DEBUG
+        print("EAS_REDIRECT status=\(response.statusCode) target=\(destination)")
+        #endif
+        if target.host?.lowercased() == "cas.s.zzu.edu.cn" {
+            throw PocketError.message("教务要求重新认证，请在“我的”中重新登录学校账号后同步课表。")
+        }
+        guard target.scheme?.lowercased() == "https", target.host?.lowercased() == "jwxt.zzu.edu.cn",
+              target.port == nil || target.port == 443, target.user == nil, target.password == nil,
+              target.path.hasPrefix("/eams-door/api/") || target.path.hasPrefix("/eams-micro-server/api/") else {
+            throw PocketError.message("教务返回 HTTP \(response.statusCode) 跳转，目标为 \(destination)。一卡通和教务状态需分别核对，请保留此提示以定位原因。")
+        }
+        return target
+    }
+
     static func eas(_ path: String, token: String, step: String) async throws -> [String: Any] {
-        let url = try self.url(jwxt, path)
-        let (data, response) = try await request(url, headers: ["Authorization": token], redirects: false)
+        var url = try self.url(jwxt, path)
+        var visited = Set<URL>()
+        var data = Data()
+        var response: HTTPURLResponse
+        while true {
+            guard visited.insert(url).inserted, visited.count <= 4 else {
+                throw PocketError.message("本科教务跳转次数异常，请检查手机网络或稍后重试")
+            }
+            (data, response) = try await request(url, headers: ["Authorization": token], redirects: false)
+            guard (300..<400).contains(response.statusCode) else { break }
+            url = try academicRedirect(from: url, response: response)
+        }
         if response.statusCode == 401 || response.statusCode == 403 {
             let identityURL = try self.url(jwxt, "/eams-door/api/v1/portal/home/user-info")
             let identityStatus: Int?
